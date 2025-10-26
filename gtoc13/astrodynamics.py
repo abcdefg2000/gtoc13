@@ -228,6 +228,7 @@ def patched_conic_flyby(
     return h_p, is_valid
 
 
+@jit
 def flyby_excess_delta_v(
     v_inf_in: jnp.ndarray,
     v_inf_out: jnp.ndarray,
@@ -263,73 +264,111 @@ def flyby_excess_delta_v(
         gravity-assist turn. A value of zero indicates the desired flyby is
         feasible without extra thrust within the provided altitude limits.
     """
-
     v_inf_in = jnp.asarray(v_inf_in)
     v_inf_out = jnp.asarray(v_inf_out)
 
-    v_inf_in_mag = float(jnp.linalg.norm(v_inf_in))
-    v_inf_out_mag = float(jnp.linalg.norm(v_inf_out))
+    dtype = v_inf_in.dtype
+    mu = jnp.asarray(mu_body, dtype=dtype)
+    r_b = jnp.asarray(r_body, dtype=dtype)
+    atol_val = jnp.asarray(atol, dtype=dtype)
 
-    if v_inf_in_mag < atol or v_inf_out_mag < atol:
-        return float(jnp.linalg.norm(v_inf_out - v_inf_in))
+    v_inf_in_mag = jnp.linalg.norm(v_inf_in)
+    v_inf_out_mag = jnp.linalg.norm(v_inf_out)
 
-    min_altitude = 0.1 * r_body if min_altitude is None else min_altitude
-    rp_min = r_body + max(min_altitude, 0.0)
+    def degenerate_case(_):
+        return jnp.linalg.norm(v_inf_out - v_inf_in)
 
-    max_altitude = 100.0 * r_body if max_altitude is None else max_altitude
-    rp_max = r_body + max(max_altitude, 0.0)
+    def regular_case(_):
+        min_alt_val = 0.1 * r_body if min_altitude is None else min_altitude
+        max_alt_val = 100.0 * r_body if max_altitude is None else max_altitude
 
-    def _turn_angle(rp: float) -> float:
-        denom = 1.0 + rp * (v_inf_in_mag**2) / (mu_body + 1e-20)
-        denom = max(denom, 1e-20)
-        arg = min(max(1.0 / denom, -1.0), 1.0)
-        return 2.0 * float(jnp.arcsin(arg))
+        min_alt = jnp.asarray(min_alt_val, dtype=dtype)
+        max_alt = jnp.asarray(max_alt_val, dtype=dtype)
 
-    delta_max = _turn_angle(rp_min)
-    delta_min = _turn_angle(rp_max)
+        rp_min = r_b + jnp.maximum(min_alt, 0.0)
+        rp_max = r_b + jnp.maximum(max_alt, 0.0)
 
-    cos_delta_req = jnp.dot(v_inf_in, v_inf_out) / (v_inf_in_mag * v_inf_out_mag)
-    cos_delta_req = float(jnp.clip(cos_delta_req, -1.0, 1.0))
-    delta_req = float(jnp.arccos(cos_delta_req))
+        def turn_angle(rp):
+            denom = 1.0 + rp * (v_inf_in_mag**2) / (mu + 1e-20)
+            denom = jnp.maximum(denom, 1e-20)
+            arg = jnp.clip(1.0 / denom, -1.0, 1.0)
+            return 2.0 * jnp.arcsin(arg)
 
-    delta_clamped = min(max(delta_req, delta_min), delta_max)
+        delta_max = turn_angle(rp_min)
+        delta_min = turn_angle(rp_max)
 
-    u_in = (v_inf_in / v_inf_in_mag).astype(float)
-    u_out = (v_inf_out / v_inf_out_mag).astype(float)
+        cos_delta_req = jnp.dot(v_inf_in, v_inf_out) / (v_inf_in_mag * v_inf_out_mag + 1e-20)
+        cos_delta_req = jnp.clip(cos_delta_req, -1.0, 1.0)
+        delta_req = jnp.arccos(cos_delta_req)
 
-    axis = jnp.cross(u_in, u_out)
-    axis_norm = float(jnp.linalg.norm(axis))
+        delta_lower = jnp.minimum(delta_min, delta_max)
+        delta_upper = jnp.maximum(delta_min, delta_max)
+        delta_clamped = jnp.clip(delta_req, delta_lower, delta_upper)
 
-    if axis_norm < atol:
-        if delta_clamped <= delta_req + atol:
-            k = axis
-        else:
-            trial_axis = jnp.cross(u_in, jnp.array([1.0, 0.0, 0.0]))
-            if float(jnp.linalg.norm(trial_axis)) < atol:
-                trial_axis = jnp.cross(u_in, jnp.array([0.0, 1.0, 0.0]))
-            k = trial_axis
-            axis_norm = float(jnp.linalg.norm(k))
-            if axis_norm < atol:
-                k = jnp.array([0.0, 0.0, 1.0])
-    else:
-        k = axis
+        u_in = v_inf_in / (v_inf_in_mag + 1e-20)
+        u_out = v_inf_out / (v_inf_out_mag + 1e-20)
 
-    axis_norm = float(jnp.linalg.norm(k))
-    if axis_norm < atol:
-        u_rot = u_in
-    else:
-        k_unit = k / axis_norm
-        cos_theta = jnp.cos(delta_clamped)
-        sin_theta = jnp.sin(delta_clamped)
-        u_rot = (
-            u_in * cos_theta
-            + jnp.cross(k_unit, u_in) * sin_theta
-            + k_unit * jnp.dot(k_unit, u_in) * (1.0 - cos_theta)
-        )
+        basis_x = jnp.array([1.0, 0.0, 0.0], dtype=dtype)
+        basis_y = jnp.array([0.0, 1.0, 0.0], dtype=dtype)
+        basis_z = jnp.array([0.0, 0.0, 1.0], dtype=dtype)
 
-    v_best = v_inf_in_mag * u_rot
-    delta_v = jnp.linalg.norm(v_inf_out - v_best)
-    return float(delta_v)
+        axis = jnp.cross(u_in, u_out)
+        axis_norm = jnp.linalg.norm(axis)
+
+        def axis_zero_case(_):
+            def keep_axis(_):
+                return axis
+
+            def fallback_axis(_):
+                trial = jnp.cross(u_in, basis_x)
+                trial_norm = jnp.linalg.norm(trial)
+                trial = jax.lax.cond(
+                    trial_norm < atol_val,
+                    lambda _: jnp.cross(u_in, basis_y),
+                    lambda _: trial,
+                    operand=None,
+                )
+                trial_norm = jnp.linalg.norm(trial)
+                trial = jax.lax.cond(
+                    trial_norm < atol_val,
+                    lambda _: basis_z,
+                    lambda _: trial,
+                    operand=None,
+                )
+                return trial
+
+            return jax.lax.cond(
+                delta_clamped <= delta_req + atol_val,
+                keep_axis,
+                fallback_axis,
+                operand=None,
+            )
+
+        k = jax.lax.cond(axis_norm < atol_val, axis_zero_case, lambda _: axis, operand=None)
+        k_norm = jnp.linalg.norm(k)
+
+        def rotate_case(_):
+            k_unit = k / (k_norm + 1e-20)
+            cos_theta = jnp.cos(delta_clamped)
+            sin_theta = jnp.sin(delta_clamped)
+            return (
+                u_in * cos_theta
+                + jnp.cross(k_unit, u_in) * sin_theta
+                + k_unit * jnp.dot(k_unit, u_in) * (1.0 - cos_theta)
+            )
+
+        u_rot = jax.lax.cond(k_norm < atol_val, lambda _: u_in, rotate_case, operand=None)
+
+        v_best = v_inf_in_mag * u_rot
+        delta_v = jnp.linalg.norm(v_inf_out - v_best)
+        return delta_v
+
+    return jax.lax.cond(
+        (v_inf_in_mag < atol_val) | (v_inf_out_mag < atol_val),
+        degenerate_case,
+        regular_case,
+        operand=None,
+    )
 
 
 @jit
