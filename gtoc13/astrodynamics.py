@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, PIDController
-from typing import Tuple
+from typing import Optional, Tuple
 import numpy as np
 
 from .orbital_elements import OrbitalElements
@@ -226,6 +226,110 @@ def patched_conic_flyby(
     is_valid = (mag_diff < 1e-4) & (h_p >= 0.1 * r_body) & (h_p <= 100.0 * r_body)
     
     return h_p, is_valid
+
+
+def flyby_excess_delta_v(
+    v_inf_in: jnp.ndarray,
+    v_inf_out: jnp.ndarray,
+    mu_body: float,
+    r_body: float,
+    min_altitude: Optional[float] = None,
+    max_altitude: Optional[float] = None,
+    atol: float = 1e-12,
+) -> float:
+    """Compute the additional ΔV required beyond a gravity assist.
+
+    The function assumes a patched-conic flyby model where the spacecraft
+    experiences a turn while conserving the magnitude of its hyperbolic
+    excess velocity. The achievable turn angle is bounded by the periapsis
+    altitude limits supplied. When the requested turn lies outside those
+    bounds (or when the incoming/outgoing magnitudes differ), the function
+    returns the minimal instantaneous ΔV needed to match the desired outgoing
+    v-infinity vector.
+
+    Args:
+        v_inf_in: Incoming hyperbolic excess velocity vector (km/s).
+        v_inf_out: Desired outgoing hyperbolic excess velocity vector (km/s).
+        mu_body: Standard gravitational parameter of the flyby body (km^3/s^2).
+        r_body: Body radius (km).
+        min_altitude: Minimum allowable periapsis altitude above the surface
+            (km). Defaults to ``0.1 * r_body`` when ``None``.
+        max_altitude: Maximum allowable periapsis altitude above the surface
+            (km). Defaults to ``100.0 * r_body`` when ``None``.
+        atol: Numerical tolerance used when detecting degenerate directions.
+
+    Returns:
+        The excess ΔV in km/s that must be supplied in addition to the
+        gravity-assist turn. A value of zero indicates the desired flyby is
+        feasible without extra thrust within the provided altitude limits.
+    """
+
+    v_inf_in = jnp.asarray(v_inf_in)
+    v_inf_out = jnp.asarray(v_inf_out)
+
+    v_inf_in_mag = float(jnp.linalg.norm(v_inf_in))
+    v_inf_out_mag = float(jnp.linalg.norm(v_inf_out))
+
+    if v_inf_in_mag < atol or v_inf_out_mag < atol:
+        return float(jnp.linalg.norm(v_inf_out - v_inf_in))
+
+    min_altitude = 0.1 * r_body if min_altitude is None else min_altitude
+    rp_min = r_body + max(min_altitude, 0.0)
+
+    max_altitude = 100.0 * r_body if max_altitude is None else max_altitude
+    rp_max = r_body + max(max_altitude, 0.0)
+
+    def _turn_angle(rp: float) -> float:
+        denom = 1.0 + rp * (v_inf_in_mag**2) / (mu_body + 1e-20)
+        denom = max(denom, 1e-20)
+        arg = min(max(1.0 / denom, -1.0), 1.0)
+        return 2.0 * float(jnp.arcsin(arg))
+
+    delta_max = _turn_angle(rp_min)
+    delta_min = _turn_angle(rp_max)
+
+    cos_delta_req = jnp.dot(v_inf_in, v_inf_out) / (v_inf_in_mag * v_inf_out_mag)
+    cos_delta_req = float(jnp.clip(cos_delta_req, -1.0, 1.0))
+    delta_req = float(jnp.arccos(cos_delta_req))
+
+    delta_clamped = min(max(delta_req, delta_min), delta_max)
+
+    u_in = (v_inf_in / v_inf_in_mag).astype(float)
+    u_out = (v_inf_out / v_inf_out_mag).astype(float)
+
+    axis = jnp.cross(u_in, u_out)
+    axis_norm = float(jnp.linalg.norm(axis))
+
+    if axis_norm < atol:
+        if delta_clamped <= delta_req + atol:
+            k = axis
+        else:
+            trial_axis = jnp.cross(u_in, jnp.array([1.0, 0.0, 0.0]))
+            if float(jnp.linalg.norm(trial_axis)) < atol:
+                trial_axis = jnp.cross(u_in, jnp.array([0.0, 1.0, 0.0]))
+            k = trial_axis
+            axis_norm = float(jnp.linalg.norm(k))
+            if axis_norm < atol:
+                k = jnp.array([0.0, 0.0, 1.0])
+    else:
+        k = axis
+
+    axis_norm = float(jnp.linalg.norm(k))
+    if axis_norm < atol:
+        u_rot = u_in
+    else:
+        k_unit = k / axis_norm
+        cos_theta = jnp.cos(delta_clamped)
+        sin_theta = jnp.sin(delta_clamped)
+        u_rot = (
+            u_in * cos_theta
+            + jnp.cross(k_unit, u_in) * sin_theta
+            + k_unit * jnp.dot(k_unit, u_in) * (1.0 - cos_theta)
+        )
+
+    v_best = v_inf_in_mag * u_rot
+    delta_v = jnp.linalg.norm(v_inf_out - v_best)
+    return float(delta_v)
 
 
 @jit
